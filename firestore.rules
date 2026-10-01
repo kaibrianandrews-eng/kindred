@@ -1,0 +1,106 @@
+rules_version = '2';
+
+// Kindred security rules. These run on Google's servers, so nobody can get
+// around them by changing the code in their browser.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    // A real account (email or Google), not a guest.
+    function member() { return signedIn() && request.auth.token.firebase.sign_in_provider != 'anonymous'; }
+    function me() { return request.auth.uid; }
+    function userDoc(uid) { return /databases/$(database)/documents/users/$(uid); }
+    function isAdmin() { return signedIn() && exists(/databases/$(database)/documents/admins/$(me())); }
+    // Has picked a username and is not banned.
+    function canPost() { return member() && exists(userDoc(me())) && get(userDoc(me())).data.banned != true; }
+    function goodText(t, max) { return t is string && t.size() > 0 && t.size() <= max; }
+    function okBio(d) { return d.bio is string && d.bio.size() <= 120; }
+    function ownsName(d) {
+      return d.username is string
+        && getAfter(/databases/$(database)/documents/usernames/$(d.username)).data.uid == me();
+    }
+
+    // Admins are added by hand in the Firebase console (see README).
+    match /admins/{uid} {
+      allow read: if signedIn() && uid == me();
+      allow write: if false;
+    }
+
+    // One document per username, so two people can't take the same name.
+    match /usernames/{name} {
+      allow read: if signedIn();
+      allow create: if member()
+        && name.matches('^[a-z0-9_]{3,20}$')
+        && request.resource.data.keys().hasOnly(['uid'])
+        && request.resource.data.uid == me();
+      allow delete: if member() && resource.data.uid == me();
+    }
+
+    match /users/{uid} {
+      allow read: if signedIn();
+      allow create: if member() && uid == me()
+        && request.resource.data.keys().hasOnly(['username', 'bio', 'joined', 'banned'])
+        && request.resource.data.banned == false
+        && request.resource.data.joined == request.time
+        && okBio(request.resource.data)
+        && ownsName(request.resource.data);
+      allow update: if (member() && uid == me()
+          && request.resource.data.keys().hasOnly(['username', 'bio', 'joined', 'banned'])
+          && request.resource.data.banned == resource.data.banned
+          && request.resource.data.joined == resource.data.joined
+          && okBio(request.resource.data)
+          && ownsName(request.resource.data))
+        || (isAdmin() && uid != me()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['banned'])
+          && request.resource.data.banned is bool);
+
+      // Each person's own Shield settings, muted words and blocks.
+      match /private/{docId} {
+        allow read, write: if signedIn() && uid == me();
+      }
+    }
+
+    match /posts/{postId} {
+      allow read: if signedIn();
+      allow create: if canPost()
+        && request.resource.data.keys().hasOnly(['author', 'text', 'at', 'likes'])
+        && request.resource.data.author == me()
+        && goodText(request.resource.data.text, 1000)
+        && request.resource.data.at == request.time
+        && request.resource.data.likes == [];
+      // Liking: you can only add or remove yourself.
+      allow update: if member() && likeOnly();
+      allow delete: if (member() && resource.data.author == me()) || isAdmin();
+    }
+    function likeOnly() {
+      let before = resource.data.likes.toSet();
+      let after = request.resource.data.likes.toSet();
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(['likes'])
+        && request.resource.data.likes is list
+        && after.difference(before).union(before.difference(after)) == [me()].toSet();
+    }
+
+    match /comments/{commentId} {
+      allow read: if signedIn();
+      allow create: if canPost()
+        && request.resource.data.keys().hasOnly(['post', 'author', 'text', 'at'])
+        && request.resource.data.author == me()
+        && goodText(request.resource.data.text, 500)
+        && request.resource.data.at == request.time
+        && request.resource.data.post is string
+        && exists(/databases/$(database)/documents/posts/$(request.resource.data.post));
+      allow delete: if (member() && resource.data.author == me()) || isAdmin();
+    }
+
+    // Reports can only be read by admins.
+    match /reports/{reportId} {
+      allow create: if member()
+        && request.resource.data.keys().hasOnly(['by', 'target', 'post', 'comment', 'text', 'reason', 'at'])
+        && request.resource.data.by == me()
+        && request.resource.data.at == request.time
+        && request.resource.data.text is string && request.resource.data.text.size() <= 1000
+        && request.resource.data.reason is string && request.resource.data.reason.size() <= 60;
+      allow read, delete: if isAdmin();
+    }
+  }
+}
